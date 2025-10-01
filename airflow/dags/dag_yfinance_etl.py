@@ -1,27 +1,31 @@
 # dags/dag_yfinance_etl.py
-# Simple, reliable ETL: yfinance -> Snowflake via write_pandas (staging) -> DELETE→INSERT upsert
-# Airflow Variables expected:
-#   - stock_symbols: JSON array, e.g. ["AAPL","MSFT","TSLA"]
-#   - lookback_days: e.g. 365
-#   - target_schema_raw: default "RAW"
+# Airflow DAG #1 — yfinance → Snowflake (ETL) with strict date handling (no "Invalid date")
 #
-# Airflow Connection "snowflake_catfish" (Conn Type: Snowflake) Extra example:
-# {
-#   "account": "LVB17920",
-#   "warehouse": "CAT_QUERY_WH",
-#   "database": "USER_DB_CATFISH",
-#   "role": "TRAINING_ROLE",
-#   "insecure_mode": true
-# }
+# Airflow Variables (Admin → Variables):
+#   - stock_symbols       JSON, e.g. ["AAPL","MSFT","TSLA"] (default: AAPL,MSFT,TSLA)
+#   - lookback_days       int, e.g. 365 (default: 365)
+#   - target_schema_raw   str, e.g. "RAW" (default: RAW)
+#
+# Airflow Connection: snowflake_catfish (Conn Type: Snowflake)
+#   Extra JSON example:
+#   {
+#     "account": "xxxx-xxxx",
+#     "warehouse": "COMPUTE_WH",
+#     "database": "YOUR_DB",
+#     "schema": "RAW",
+#     "role": "SYSADMIN"
+#   }
+
+from __future__ import annotations
 
 import json
-from datetime import datetime, date, timedelta, timezone as dt_tz
-from typing import Optional, List
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import List
 
 import pandas as pd
 import yfinance as yf
 import snowflake.connector
-from snowflake.connector.pandas_tools import write_pandas
 
 from airflow import DAG
 from airflow.models import Variable
@@ -32,216 +36,226 @@ SNOWFLAKE_CONN_ID = "snowflake_catfish"
 default_args = {"depends_on_past": False, "retries": 1}
 
 
-def _sf_connect(default_schema: Optional[str] = None):
-    """Build a Snowflake connection from Airflow Connection extras."""
+def _sf_connect(schema_override: str | None = None):
+    """Build a snowflake.connector connection from the Airflow Connection."""
     c = BaseHook.get_connection(SNOWFLAKE_CONN_ID)
     extra = c.extra_dejson or {}
     params = {
-        "account":        extra.get("account"),
-        "user":           c.login,
-        "password":       c.password,
-        "warehouse":      extra.get("warehouse"),
-        "database":       extra.get("database"),
-        "schema":         extra.get("schema", default_schema),
-        "role":           extra.get("role"),
-        "insecure_mode":  extra.get("insecure_mode", False),
+        "account": extra.get("account"),
+        "user": c.login,
+        "password": c.password,
+        "warehouse": extra.get("warehouse"),
+        "database": extra.get("database"),
+        "schema": schema_override or extra.get("schema"),
+        "role": extra.get("role"),
+        "client_session_keep_alive": True,
     }
     params = {k: v for k, v in params.items() if v is not None}
     return snowflake.connector.connect(**params)
 
 
+def _fetch_prices(symbols: List[str], start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    Fetch OHLCV with yfinance and return long-form DataFrame with:
+      TRADE_DATE (date), SYMBOL, OPEN, HIGH, LOW, CLOSE, ADJ_CLOSE, VOLUME
+    STRICT date handling: drops unparsable timestamps → no "Invalid date".
+    """
+    if not symbols:
+        return pd.DataFrame(
+            columns=["TRADE_DATE", "SYMBOL", "OPEN", "HIGH", "LOW", "CLOSE", "ADJ_CLOSE", "VOLUME"]
+        )
+
+    raw = yf.download(
+        tickers=" ".join(symbols),
+        start=start_date,
+        end=end_date,
+        auto_adjust=False,   # keep Close and Adj Close distinct
+        group_by="ticker",
+        progress=False,
+        threads=True,
+    )
+
+    # Normalize possible MultiIndex columns
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = ["_".join([str(c) for c in tup if c]) for tup in raw.columns]
+
+    # --- FIXED DATE HANDLING ---
+    idx = pd.to_datetime(raw.index, errors="coerce").tz_localize(None)  # DatetimeIndex
+    df_base = raw.reset_index(drop=True).copy()
+
+    ts = pd.Series(idx, name="TRADE_TS", dtype="datetime64[ns]")  # Series to use .dt
+    good = ts.notna()
+    df_base = df_base.loc[good].copy()
+    ts = ts.loc[good]
+    # Keep as Python date objects (this is crucial for clean executemany binding)
+    trade_dates = ts.dt.date
+    # ---------------------------
+
+    # Build long-form rows per symbol
+    rows = []
+    for sym in symbols:
+        sym_u = str(sym).upper().strip()
+        col_map = {
+            "OPEN":      [f"{sym_u}_Open", "Open"],
+            "HIGH":      [f"{sym_u}_High", "High"],
+            "LOW":       [f"{sym_u}_Low", "Low"],
+            "CLOSE":     [f"{sym_u}_Close", "Close"],
+            "ADJ_CLOSE": [f"{sym_u}_Adj Close", "Adj Close", f"{sym_u}_Adj_Close", "Adj_Close"],
+            "VOLUME":    [f"{sym_u}_Volume", "Volume"],
+        }
+
+        def pick(colnames):
+            for c in colnames:
+                if c in df_base.columns:
+                    return df_base[c]
+            return pd.Series([None] * len(df_base), index=df_base.index)
+
+        df_sym = pd.DataFrame({
+            "TRADE_DATE": trade_dates,  # Python date
+            "SYMBOL":     sym_u,
+            "OPEN":       pick(col_map["OPEN"]),
+            "HIGH":       pick(col_map["HIGH"]),
+            "LOW":        pick(col_map["LOW"]),
+            "CLOSE":      pick(col_map["CLOSE"]),
+            "ADJ_CLOSE":  pick(col_map["ADJ_CLOSE"]),
+            "VOLUME":     pick(col_map["VOLUME"]),
+        })
+
+        # Synthesize ADJ_CLOSE if missing
+        if df_sym["ADJ_CLOSE"].isna().all():
+            df_sym["ADJ_CLOSE"] = df_sym["CLOSE"]
+
+        # Drop rows without CLOSE (prevents type issues downstream)
+        df_sym = df_sym[df_sym["CLOSE"].notna()].copy()
+        rows.append(df_sym)
+
+    if not rows:
+        return pd.DataFrame(
+            columns=["TRADE_DATE", "SYMBOL", "OPEN", "HIGH", "LOW", "CLOSE", "ADJ_CLOSE", "VOLUME"]
+        )
+
+    df = pd.concat(rows, ignore_index=True)
+
+    # Enforce types
+    df["SYMBOL"] = df["SYMBOL"].astype(str).str.upper().str.strip()
+    for col in ["OPEN", "HIGH", "LOW", "CLOSE", "ADJ_CLOSE"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["VOLUME"] = pd.to_numeric(df["VOLUME"], errors="coerce").astype("Int64")
+
+    # Final clean
+    df = df.dropna(subset=["TRADE_DATE", "SYMBOL", "CLOSE"]).copy()
+    df = df.drop_duplicates(subset=["TRADE_DATE", "SYMBOL"]).sort_values(["SYMBOL", "TRADE_DATE"])
+
+    logging.info("Fetch summary: %d rows for symbols=%s (%s → %s)",
+                 len(df), symbols, start_date, end_date)
+    return df[["TRADE_DATE", "SYMBOL", "OPEN", "HIGH", "LOW", "CLOSE", "ADJ_CLOSE", "VOLUME"]]
+
+
+def ensure_objects(**context):
+    """Ensure RAW schema/table exist with strict DATE typing (not VARCHAR)."""
+    schema = Variable.get("target_schema_raw", default_var="RAW")
+    with _sf_connect(schema) as conn, conn.cursor() as cur:
+        cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+        cur.execute(f"""
+        CREATE OR REPLACE TABLE "{schema}"."STOCK_PRICES" (
+          TRADE_DATE DATE NOT NULL,
+          SYMBOL     STRING NOT NULL,
+          OPEN       DOUBLE,
+          HIGH       DOUBLE,
+          LOW        DOUBLE,
+          CLOSE      DOUBLE,
+          ADJ_CLOSE  DOUBLE,
+          VOLUME     NUMBER(38,0),
+          LOAD_TS    TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+          CONSTRAINT PK_STOCK_PRICES PRIMARY KEY (SYMBOL, TRADE_DATE)
+        );
+        """)
+    return f'Ensured "{schema}".STOCK_PRICES exists'
+
+
+def fetch_and_load_prices(**context):
+    """Fetch from yfinance, stage into a TEMP table via executemany (DATE-safe), then upsert into target."""
+    # Read config
+    symbols_var = Variable.get("stock_symbols", default_var='["AAPL","MSFT","TSLA"]')
+    try:
+        symbols = json.loads(symbols_var)
+        if not isinstance(symbols, list):
+            raise ValueError
+    except Exception:
+        symbols = [s.strip() for s in symbols_var.split(",") if s.strip()]
+    lookback_days = int(Variable.get("lookback_days", default_var="365"))
+    schema = Variable.get("target_schema_raw", default_var="RAW")
+
+    end_dt = datetime.now(timezone.utc).date()
+    start_dt = end_dt - timedelta(days=lookback_days)
+
+    df = _fetch_prices(symbols, start_dt.isoformat(), end_dt.isoformat())
+    logging.info("ETL dataframe shape: %s", df.shape)
+
+    if df.empty:
+        return f"No rows fetched for symbols={symbols} in {start_dt}..{end_dt}"
+
+    # Make sure TRADE_DATE is a Python date for clean binding
+    df["TRADE_DATE"] = pd.to_datetime(df["TRADE_DATE"], errors="coerce").dt.date
+    if df["TRADE_DATE"].isna().any():
+        # Should never happen, but guard anyway
+        df = df[df["TRADE_DATE"].notna()].copy()
+
+    target = f'"{schema}"."STOCK_PRICES"'
+    tmp_name = f'STOCK_PRICES_LOAD_{int(datetime.now().timestamp())}'
+    tmp_table = f'"{schema}"."{tmp_name}"'
+
+    # Prepare row tuples for executemany
+    rows = list(
+        df[["TRADE_DATE", "SYMBOL", "OPEN", "HIGH", "LOW", "CLOSE", "ADJ_CLOSE", "VOLUME"]]
+        .itertuples(index=False, name=None)
+    )
+
+    with _sf_connect(schema) as conn, conn.cursor() as cur:
+        try:
+            # 1) Temp table to receive batch (same schema)
+            cur.execute(f"CREATE TEMPORARY TABLE {tmp_table} LIKE {target};")
+
+            # 2) Insert rows into temp table using executemany (DATE-safe)
+            insert_sql = f"""
+                INSERT INTO {tmp_table}
+                (TRADE_DATE, SYMBOL, OPEN, HIGH, LOW, CLOSE, ADJ_CLOSE, VOLUME)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            """
+            cur.executemany(insert_sql, rows)
+            logging.info("Inserted %d rows into %s", len(rows), tmp_table)
+
+            # 3) Upsert semantics: delete overlap on (SYMBOL, TRADE_DATE), then insert
+            cur.execute(f"""
+            DELETE FROM {target} t
+            USING {tmp_table} s
+            WHERE t.SYMBOL = s.SYMBOL
+              AND t.TRADE_DATE = s.TRADE_DATE;
+            """)
+            cur.execute(f"""
+            INSERT INTO {target} (TRADE_DATE, SYMBOL, OPEN, HIGH, LOW, CLOSE, ADJ_CLOSE, VOLUME)
+            SELECT TRADE_DATE, SYMBOL, OPEN, HIGH, LOW, CLOSE, ADJ_CLOSE, VOLUME
+            FROM {tmp_table};
+            """)
+
+            cur.execute(f"SELECT COUNT(*) FROM {target}")
+            total = cur.fetchone()[0]
+            return f"Loaded {len(rows)} rows. Total rows now in {schema}.STOCK_PRICES = {total}"
+        finally:
+            try:
+                cur.execute(f"DROP TABLE IF EXISTS {tmp_table}")
+            except Exception:
+                pass
+
+
 with DAG(
     dag_id="yfinance_etl",
-    schedule="@daily",  # trigger daily
-    start_date=datetime(2025, 9, 1, tzinfo=dt_tz.utc),
+    schedule="@daily",
+    start_date=datetime(2025, 9, 1, tzinfo=timezone.utc),
     catchup=False,
     default_args=default_args,
     tags=["etl", "yfinance", "snowflake"],
 ) as dag:
-
-    def ensure_objects():
-        """Create RAW schema, RAW.STOCK_PRICES (PK), and RAW.STOCK_PRICES_STAGE (no PK)."""
-        schema_raw = Variable.get("target_schema_raw", default_var="RAW")
-        conn = _sf_connect(default_schema=schema_raw)
-        cur = conn.cursor()
-        try:
-            conn.autocommit(False)
-
-            cur.execute("SELECT CURRENT_DATABASE(), CURRENT_SCHEMA(), CURRENT_ROLE(), CURRENT_WAREHOUSE()")
-            db, sch, role, wh = cur.fetchone()
-            print(f"[BOOT] DB={db} SCHEMA={sch} ROLE={role} WH={wh}", flush=True)
-
-            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {db}.{schema_raw}")
-
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {db}.{schema_raw}.STOCK_PRICES (
-                  SYMBOL STRING NOT NULL,
-                  TS TIMESTAMP_NTZ NOT NULL,
-                  OPEN FLOAT,
-                  HIGH FLOAT,
-                  LOW FLOAT,
-                  CLOSE FLOAT,
-                  ADJ_CLOSE FLOAT,
-                  VOLUME NUMBER(38,0),
-                  LOAD_TS TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
-                  CONSTRAINT PK_STOCK_PRICES PRIMARY KEY (SYMBOL, TS)
-                )
-            """)
-
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {db}.{schema_raw}.STOCK_PRICES_STAGE (
-                  SYMBOL STRING,
-                  TS TIMESTAMP_NTZ,
-                  OPEN FLOAT,
-                  HIGH FLOAT,
-                  LOW FLOAT,
-                  CLOSE FLOAT,
-                  ADJ_CLOSE FLOAT,
-                  VOLUME NUMBER(38,0)
-                )
-            """)
-
-            conn.commit()
-            print(f"[DDL] Ensured {db}.{schema_raw}.STOCK_PRICES and {db}.{schema_raw}.STOCK_PRICES_STAGE.", flush=True)
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            cur.close()
-            conn.close()
-
-    def fetch_and_load_prices():
-        """
-        Fetch prices with yfinance Ticker().history() (stable columns),
-        stage with write_pandas, then DELETE→INSERT upsert into RAW.STOCK_PRICES.
-        """
-        schema_raw = Variable.get("target_schema_raw", default_var="RAW")
-
-        # Variables
-        try:
-            symbols = json.loads(Variable.get("stock_symbols"))
-            assert isinstance(symbols, list) and all(isinstance(x, str) for x in symbols)
-        except Exception as e:
-            raise ValueError('Airflow Variable "stock_symbols" must be JSON like ["AAPL","MSFT","TSLA"].') from e
-
-        lookback_days = int(Variable.get("lookback_days", default_var="365"))
-        end: date = datetime.now(dt_tz.utc).date()
-        start: date = end - timedelta(days=lookback_days)
-        print(f"[CFG] symbols={symbols} start={start} end={end} (history end is inclusive)", flush=True)
-
-        frames: List[pd.DataFrame] = []
-
-        for sym in symbols:
-            t = yf.Ticker(sym)
-
-            # Primary fetch: explicit start/end
-            h = t.history(start=str(start), end=str(end), interval="1d", auto_adjust=False)
-            if h.empty:
-                # Fallback fetch: recent period
-                h = t.history(period="60d", interval="1d", auto_adjust=False)
-                print(f"[YF] {sym}: empty for start/end; retry period=60d → empty={h.empty}", flush=True)
-
-            if h.empty:
-                continue
-
-            # Expected columns: Open, High, Low, Close, Volume (+/- Adj Close)
-            h = h.reset_index()
-            df = h.rename(columns={
-                "Date": "TS",
-                "Open": "OPEN",
-                "High": "HIGH",
-                "Low": "LOW",
-                "Close": "CLOSE",
-                "Adj Close": "ADJ_CLOSE",
-                "Volume": "VOLUME",
-            })
-
-            if "ADJ_CLOSE" not in df.columns:
-                df["ADJ_CLOSE"] = df["CLOSE"]
-
-            df["TS"] = pd.to_datetime(df["TS"], utc=True, errors="coerce")
-            for c in ["OPEN", "HIGH", "LOW", "CLOSE", "ADJ_CLOSE", "VOLUME"]:
-                if c in df.columns:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
-
-            df["SYMBOL"] = sym
-            df = df[["SYMBOL", "TS", "OPEN", "HIGH", "LOW", "CLOSE", "ADJ_CLOSE", "VOLUME"]]
-            df = df.dropna(subset=["TS", "CLOSE"])
-
-            if not df.empty:
-                print(f"[YF] {sym}: rows={len(df)} TS[{df['TS'].min()}..{df['TS'].max()}]", flush=True)
-                frames.append(df)
-            else:
-                print(f"[YF] {sym}: normalized frame empty after dropna; skipping.", flush=True)
-
-        if not frames:
-            print("[LOAD] No data to load (all tickers empty).", flush=True)
-            return "No data to load."
-
-        data = pd.concat(frames, ignore_index=True)
-
-        # Ensure NUMBER column is int/NULL for Snowflake
-        data["VOLUME"] = data["VOLUME"].apply(lambda v: None if pd.isna(v) else int(v))
-
-        # Stage and upsert
-        conn = _sf_connect(default_schema=schema_raw)
-        cur = conn.cursor()
-        try:
-            conn.autocommit(False)
-
-            cur.execute("SELECT CURRENT_DATABASE()")
-            db = cur.fetchone()[0]
-            stage  = f"{db}.{schema_raw}.STOCK_PRICES_STAGE"
-            target = f"{db}.{schema_raw}.STOCK_PRICES"
-
-            cur.execute(f"TRUNCATE TABLE {stage}")
-            ok, chunks, nrows, _ = write_pandas(
-                conn, data,
-                table_name="STOCK_PRICES_STAGE",
-                database=db, schema=schema_raw,
-                auto_create_table=False, quote_identifiers=False
-            )
-            print(f"[STAGE] write_pandas ok={ok} rows={nrows} chunks={chunks}", flush=True)
-
-            # DELETE→INSERT upsert (PK on SYMBOL,TS avoids dupes)
-            cur.execute(f"""
-                DELETE FROM {target} t
-                USING {stage} s
-                WHERE t.SYMBOL = s.SYMBOL
-                  AND t.TS     = s.TS
-            """)
-            try:
-                cur.execute("SELECT SQLROWCOUNT()")
-                print(f"[UPSERT] Deleted: {cur.fetchone()[0]}", flush=True)
-            except Exception:
-                pass
-
-            cur.execute(f"""
-                INSERT INTO {target}
-                    (SYMBOL, TS, OPEN, HIGH, LOW, CLOSE, ADJ_CLOSE, VOLUME)
-                SELECT SYMBOL, TS, OPEN, HIGH, LOW, CLOSE, ADJ_CLOSE, VOLUME
-                FROM {stage}
-            """)
-            try:
-                cur.execute("SELECT SQLROWCOUNT()")
-                print(f"[UPSERT] Inserted: {cur.fetchone()[0]}", flush=True)
-            except Exception:
-                pass
-
-            conn.commit()
-
-            cur.execute(f"SELECT COUNT(*) FROM {target}")
-            total = cur.fetchone()[0]
-            print(f"[DONE] Total rows now in {target}: {total}", flush=True)
-            return f"Loaded {len(data)} rows into {target}"
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            cur.close()
-            conn.close()
-
-    ensure = PythonOperator(task_id="ensure_objects", python_callable=ensure_objects)
-    load   = PythonOperator(task_id="fetch_and_load_prices", python_callable=fetch_and_load_prices)
-
-    ensure >> load
+    t1 = PythonOperator(task_id="ensure_objects", python_callable=ensure_objects)
+    t2 = PythonOperator(task_id="fetch_and_load_prices", python_callable=fetch_and_load_prices)
+    t1 >> t2
