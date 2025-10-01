@@ -1,173 +1,158 @@
-# dags/dag_ml_forecast_tf.py  — TaskFlow version of DAG2 (no Jinja, no providers)
-from datetime import datetime, timezone
-from airflow.decorators import dag, task
-from airflow.hooks.base import BaseHook
+# dags/dag_ml_forecast_tf.py
+# Airflow DAG #2 — ML Forecasting → Snowflake (Union with ETL)
+# - No heavy ML deps at parse-time (TensorFlow/sklearn kept out)
+# - Creates/ensures schemas and tables
+# - Forecasts per-ticker with a simple MA5 extrapolation
+# - Writes to ML.FORECAST_OUTPUT and builds ANALYTICS.STOCK_PRICES_FINAL (union)
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta, timezone, date
+
+import numpy as np
+import pandas as pd
+
+from airflow import DAG
 from airflow.models import Variable
-import snowflake.connector
+from airflow.hooks.base import BaseHook
+from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import PythonOperator
 
 SNOWFLAKE_CONN_ID = "snowflake_catfish"
-RAW, MODEL, ANALYTICS = "RAW", "MODEL", "ANALYTICS"
-RAW_STOCK_PRICES = f"{RAW}.STOCK_PRICES"
-MODEL_FORECASTS  = f"{MODEL}.FORECASTS"
-ANALYTICS_FINAL  = f"{ANALYTICS}.FINAL_PRICES_FORECAST"
 
-def _sf_connect(default_schema=None):
+# ---------- Airflow Variables (with sane defaults) ----------
+# Comma-separated tickers, e.g. "AAPL,MSFT"
+VAR_TICKERS = Variable.get("tickers", default_var="AAPL,MSFT")
+# Lookback window for training (days)
+VAR_LOOKBACK_DAYS = int(Variable.get("forecast_lookback_days", default_var="365"))
+# Forecast horizon (business days)
+VAR_FORECAST_DAYS = int(Variable.get("forecast_days", default_var="14"))
+
+# Schema/table names (override via Variables if your naming differs)
+SCHEMA_RAW = Variable.get("schema_raw", default_var="RAW")
+SCHEMA_ML = Variable.get("schema_ml", default_var="ML")
+SCHEMA_ANALYTICS = Variable.get("schema_analytics", default_var="ANALYTICS")
+
+TABLE_PRICES = Variable.get("table_prices", default_var="STOCK_PRICES")
+TABLE_FORECAST = Variable.get("table_forecast", default_var="FORECAST_OUTPUT")
+TABLE_FINAL = Variable.get("table_final", default_var="STOCK_PRICES_FINAL")
+
+# ---------- Helpers ----------
+def _sf_connect(default_schema: str | None = None):
+    """
+    Create a snowflake.connector connection using Airflow Connection extras.
+    Place account/warehouse/database/role in Connection's 'Extra' JSON.
+    """
+    import snowflake.connector  # safe at parse time
+
     c = BaseHook.get_connection(SNOWFLAKE_CONN_ID)
     extra = c.extra_dejson or {}
-    kw = {
+    params = {
         "account":   extra.get("account"),
         "user":      c.login,
         "password":  c.password,
         "warehouse": extra.get("warehouse"),
         "database":  extra.get("database"),
-        "schema":    extra.get("schema", default_schema),
         "role":      extra.get("role"),
     }
-    return snowflake.connector.connect(**{k:v for k,v in kw.items() if v is not None})
+    if default_schema:
+        params["schema"] = default_schema
+    # Optional: allow insecure_mode in lab setups
+    if "insecure_mode" in extra:
+        params["insecure_mode"] = bool(extra.get("insecure_mode"))
+    return snowflake.connector.connect(**params)
 
-@dag(
-    dag_id="ml_forecast_tf",
-    schedule="@daily",
-    start_date=datetime(2025, 9, 1, tzinfo=timezone.utc),
-    catchup=False,
-    tags=["ml","forecast","snowflake"],
-)
-def ml_forecast_tf():
+def _ensure_objects(**_):
+    """
+    Create required schemas and tables if they don't exist.
+    RAW.STOCK_PRICES is assumed to be created by DAG #1.
+    """
+    conn = _sf_connect()
+    try:
+        with conn.cursor() as cur:
+            # Schemas
+            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA_RAW}")
+            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA_ML}")
+            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA_ANALYTICS}")
 
-    @task
-    def ensure_objects():
-        conn = _sf_connect(MODEL); cur = conn.cursor()
-        try:
-            conn.autocommit(False)
-            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {MODEL}")
-            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {ANALYTICS}")
+            # Forecast output table (per-ticker daily forecast)
             cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {MODEL_FORECASTS} (
-                  SYMBOL STRING NOT NULL, TS DATE NOT NULL, PREDICTED_CLOSE FLOAT NOT NULL,
-                  MODEL_NAME STRING NOT NULL, TRAINED_AT TIMESTAMP_NTZ NOT NULL,
-                  HORIZON_D NUMBER(5,0) NOT NULL, LOAD_TS TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
-                  CONSTRAINT PK_FORECASTS PRIMARY KEY (SYMBOL, TS, MODEL_NAME)
+                CREATE TABLE IF NOT EXISTS {SCHEMA_ML}.{TABLE_FORECAST} (
+                    TICKER        STRING,
+                    DS            DATE,
+                    FORECAST_CLOSE FLOAT,
+                    MODEL_NAME    STRING,
+                    TRAIN_WINDOW  INTEGER,
+                    HORIZON_DAYS  INTEGER,
+                    RUN_AT        TIMESTAMP_NTZ,
+                    PRIMARY KEY (TICKER, DS)
                 )
             """)
+
+            # Final union table (will be (re)built later)
             cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {ANALYTICS_FINAL} (
-                  SYMBOL STRING NOT NULL, TS DATE NOT NULL, CLOSE FLOAT,
-                  SOURCE STRING NOT NULL, MODEL_NAME STRING,
-                  LOAD_TS TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
-                  CONSTRAINT PK_FINAL PRIMARY KEY (SYMBOL, TS, SOURCE)
+                CREATE TABLE IF NOT EXISTS {SCHEMA_ANALYTICS}.{TABLE_FINAL} (
+                    TICKER        STRING,
+                    DS            DATE,
+                    CLOSE         FLOAT,
+                    SOURCE        STRING,          -- 'ETL' or 'FORECAST'
+                    ADJ_CLOSE     FLOAT,
+                    OPEN          FLOAT,
+                    HIGH          FLOAT,
+                    LOW           FLOAT,
+                    VOLUME        FLOAT
                 )
             """)
-            conn.commit()
-        except Exception:
-            conn.rollback(); raise
-        finally:
-            cur.close(); conn.close()
+        conn.commit()
+    finally:
+        conn.close()
 
-    @task
-    def train_model_and_forecast():
-        syms = Variable.get("stock_symbols", default_var='["AAPL","MSFT","TSLA"]')
-        lookback = int(Variable.get("lookback_days", "365"))
-        horizon  = int(Variable.get("forecast_horizon_days", "14"))
-        syms_json = syms.replace("'", "''")
+def _load_training_data(ti, **_):
+    """
+    Pull recent history from RAW.STOCK_PRICES for requested tickers.
+    Push a JSON payload to XCom.
+    """
+    tickers = [t.strip().upper() for t in VAR_TICKERS.split(",") if t.strip()]
+    since = (date.today() - timedelta(days=VAR_LOOKBACK_DAYS)).isoformat()
 
-        conn = _sf_connect(MODEL); cur = conn.cursor()
-        try:
-            # Phase 1: setup (transactional)
-            conn.autocommit(False)
-            cur.execute(f"USE SCHEMA {MODEL}")
-            cur.execute(f"""
-                CREATE OR REPLACE TEMP TABLE SYMBOLS AS
-                SELECT value::string AS SYMBOL
-                FROM TABLE(FLATTEN(input => PARSE_JSON('{syms_json}')))
-            """)
-            cur.execute(f"""
-                CREATE OR REPLACE TEMP VIEW TRAINING_DATA AS
-                SELECT TO_VARIANT(sp.SYMBOL) AS SERIES, sp.TS, sp.CLOSE
-                FROM {RAW_STOCK_PRICES} sp
-                JOIN SYMBOLS s ON s.SYMBOL = sp.SYMBOL
-                WHERE sp.TS >= DATEADD('day', -{lookback}, CURRENT_TIMESTAMP())
-            """)
-            conn.commit()  # end user txn before ML SP calls
+    sql = f"""
+        SELECT
+            TICKER,
+            CAST(DATE AS DATE) AS DS,
+            CLOSE,
+            ADJ_CLOSE,
+            OPEN, HIGH, LOW, VOLUME
+        FROM {SCHEMA_RAW}.{TABLE_PRICES}
+        WHERE TICKER IN ({','.join(['%s'] * len(tickers))})
+          AND DATE >= %s
+        ORDER BY TICKER, DS
+    """
 
-            # Phase 2: ML (no user txn)
-            conn.autocommit(True)
-            cur.execute("""
-                CREATE OR REPLACE SNOWFLAKE.ML.FORECAST PRICE_FORECASTER (
-                  INPUT_DATA        => SYSTEM$QUERY_REFERENCE($$ SELECT SERIES, TS, CLOSE FROM TRAINING_DATA $$),
-                  SERIES_COLNAME    => 'SERIES',
-                  TIMESTAMP_COLNAME => 'TS',
-                  TARGET_COLNAME    => 'CLOSE',
-                  CONFIG_OBJECT     => PARSE_JSON('{"method":"fast","on_error":"skip"}')
-                )
-            """)
-            cur.execute(f"""
-                CREATE OR REPLACE TEMP TABLE TMP_FC AS
-                SELECT SERIES::STRING AS SYMBOL, CAST(TS AS DATE) AS TS, FORECAST AS PREDICTED_CLOSE,
-                       'SNOWFLAKE_ML' AS MODEL_NAME, CURRENT_TIMESTAMP() AS TRAINED_AT,
-                       {horizon}::NUMBER AS HORIZON_D
-                FROM TABLE(PRICE_FORECASTER!FORECAST(FORECASTING_PERIODS => {horizon}))
-            """)
+    conn = _sf_connect(default_schema=SCHEMA_RAW)
+    try:
+        df = pd.read_sql(sql, conn, params=[*tickers, since])
+    finally:
+        conn.close()
 
-            # Phase 3: upsert (transactional again)
-            conn.autocommit(False)
-            cur.execute(f"""
-                MERGE INTO {MODEL_FORECASTS} t
-                USING TMP_FC s
-                ON  t.SYMBOL = s.SYMBOL AND t.TS = s.TS AND t.MODEL_NAME = s.MODEL_NAME
-                WHEN MATCHED THEN UPDATE SET
-                  PREDICTED_CLOSE = s.PREDICTED_CLOSE, TRAINED_AT = s.TRAINED_AT,
-                  HORIZON_D = s.HORIZON_D, LOAD_TS = CURRENT_TIMESTAMP()
-                WHEN NOT MATCHED THEN INSERT
-                  (SYMBOL, TS, PREDICTED_CLOSE, MODEL_NAME, TRAINED_AT, HORIZON_D)
-                  VALUES (s.SYMBOL, s.TS, s.PREDICTED_CLOSE, s.MODEL_NAME, s.TRAINED_AT, s.HORIZON_D)
-            """)
-            conn.commit()
-        except Exception:
-            try: conn.rollback()
-            except Exception: pass
-            raise
-        finally:
-            cur.close(); conn.close()
+    # Ensure types
+    if not df.empty:
+        df["DS"] = pd.to_datetime(df["DS"]).dt.date
 
-    @task
-    def build_final_union():
-        syms = Variable.get("stock_symbols", default_var='["AAPL","MSFT","TSLA"]')
-        syms_json = syms.replace("'", "''")
+    ti.xcom_push(key="training_df_json", value=df.to_json(orient="records", date_format="iso"))
 
-        conn = _sf_connect(ANALYTICS); cur = conn.cursor()
-        try:
-            conn.autocommit(False)
-            cur.execute(f"USE SCHEMA {ANALYTICS}")
-            cur.execute(f"""
-                CREATE OR REPLACE TEMP TABLE SYMBOLS AS
-                SELECT value::string AS SYMBOL
-                FROM TABLE(FLATTEN(input => PARSE_JSON('{syms_json}')))
-            """)
-            cur.execute(f"TRUNCATE TABLE {ANALYTICS_FINAL}")
-            cur.execute(f"""
-                INSERT INTO {ANALYTICS_FINAL} (SYMBOL, TS, CLOSE, SOURCE, MODEL_NAME)
-                SELECT sp.SYMBOL, CAST(sp.TS AS DATE) AS TS, sp.CLOSE, 'ACTUAL', NULL
-                FROM {RAW_STOCK_PRICES} sp
-                JOIN SYMBOLS s ON s.SYMBOL = sp.SYMBOL
-            """)
-            cur.execute(f"""
-                INSERT INTO {ANALYTICS_FINAL} (SYMBOL, TS, CLOSE, SOURCE, MODEL_NAME)
-                SELECT f.SYMBOL, f.TS, f.PREDICTED_CLOSE, 'FORECAST', f.MODEL_NAME
-                FROM {MODEL_FORECASTS} f
-                JOIN SYMBOLS s ON s.SYMBOL = f.SYMBOL
-            """)
-            conn.commit()
-        except Exception:
-            try: conn.rollback()
-            except Exception: pass
-            raise
-        finally:
-            cur.close(); conn.close()
+def _train_and_forecast(ti, **_):
+    """
+    Simple per-ticker forecast using a moving-average extrapolation.
+    Keeps deps minimal; heavy frameworks can be swapped in later.
+    """
+    # Load training set from XCom
+    records_json = ti.xcom_pull(key="training_df_json", task_ids="load_training_data")
+    df = pd.DataFrame.from_records(pd.read_json(records_json, orient="records")) if records_json else pd.DataFrame()
 
-    # TaskFlow dependencies:
-    ensure = ensure_objects()
-    train = train_model_and_forecast()
-    union = build_final_union()
-    ensure >> train >> union
+    if df.empty:
+        # Nothing to forecast
+        ti.xcom_push(key="forecast_df_json", value=pd.DataFrame().to_json(orient="records"))
+        return
 
-ml_forecast_tf()
+    df["DS"] = pd.to_d_
