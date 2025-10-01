@@ -1,0 +1,5 @@
+apache-airflow-providers-snowflake==5.5.1
+yfinance==0.2.43
+pandas==2.2.2
+numpy==1.26.4
+statsmodels==0.14.2
