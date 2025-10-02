@@ -23,6 +23,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import List
 
+
 import pandas as pd
 import yfinance as yf
 import snowflake.connector
@@ -31,6 +32,7 @@ from airflow import DAG
 from airflow.models import Variable
 from airflow.operators.python import PythonOperator
 from airflow.hooks.base import BaseHook
+from airflow.decorators import task
 
 SNOWFLAKE_CONN_ID = "snowflake_catfish"
 default_args = {"depends_on_past": False, "retries": 1}
@@ -150,7 +152,7 @@ def _fetch_prices(symbols: List[str], start_date: str, end_date: str) -> pd.Data
                  len(df), symbols, start_date, end_date)
     return df[["TRADE_DATE", "SYMBOL", "OPEN", "HIGH", "LOW", "CLOSE", "ADJ_CLOSE", "VOLUME"]]
 
-
+@task
 def ensure_objects(**context):
     """Ensure RAW schema/table exist with strict DATE typing (not VARCHAR)."""
     schema = Variable.get("target_schema_raw", default_var="RAW")
@@ -172,7 +174,7 @@ def ensure_objects(**context):
         """)
     return f'Ensured "{schema}".STOCK_PRICES exists'
 
-
+@task
 def fetch_and_load_prices(**context):
     """Fetch from yfinance, stage into a TEMP table via executemany (DATE-safe), then upsert into target."""
     # Read config
@@ -256,6 +258,7 @@ with DAG(
     default_args=default_args,
     tags=["etl", "yfinance", "snowflake"],
 ) as dag:
-    t1 = PythonOperator(task_id="ensure_objects", python_callable=ensure_objects)
-    t2 = PythonOperator(task_id="fetch_and_load_prices", python_callable=fetch_and_load_prices)
+    t1 = ensure_objects()
+    t2 = fetch_and_load_prices()
     t1 >> t2
+
